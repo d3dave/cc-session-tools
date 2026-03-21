@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Migrate Claude Code sessions to CWD after a repo rename/move.
+
+Usage: migrate-cc-project <old-project-path>
+"""
+
+import os, shutil, sys
+from pathlib import Path
+
+old = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else sys.exit("usage: migrate-cc-project <old-project-path>")
+new = os.getcwd()
+assert os.path.isabs(old), f"path must be absolute: {old}"
+assert old != new, "old and new paths are the same"
+
+projects = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude")) / "projects"
+old_dir = projects / old.replace("/", "-")
+new_dir = projects / new.replace("/", "-")
+assert old_dir.is_dir(), f"not found: {old_dir}"
+
+sessions = list(old_dir.glob("*.jsonl"))
+assert sessions, f"no sessions in {old_dir}"
+
+new_dir.mkdir(parents=True, exist_ok=True)
+print(f"Migrating {len(sessions)} session(s): {old} -> {new}\n")
+
+for jsonl in sorted(sessions, key=lambda p: p.stat().st_mtime, reverse=True):
+    sid = jsonl.stem
+    # Collect all files: the main .jsonl + everything in the session subdir
+    files = [jsonl] + (sorted((old_dir / sid).rglob("*")) if (old_dir / sid).is_dir() else [])
+    for src in files:
+        if not src.is_file():
+            continue
+        dst = new_dir / src.relative_to(old_dir)
+        if dst.exists():
+            print(f"  skip {dst.name}")
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.suffix in (".jsonl", ".json"):
+            dst.write_text(src.read_text().replace(old, new))
+        else:
+            shutil.copy2(src, dst)
+        print(f"  {dst.name}")
+    print(f"  -> claude --resume {sid}\n")
+
+try:
+    choice = input(f"Delete old project directory {old_dir}? [y/N] ").strip().lower()
+except (EOFError, KeyboardInterrupt):
+    choice = ""
+if choice == "y":
+    shutil.rmtree(old_dir)
+    print(f"Deleted {old_dir}")
+else:
+    print(f"Kept {old_dir}")

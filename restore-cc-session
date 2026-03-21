@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Restore an archived Claude Code session into the current project directory.
+
+Usage: restore-cc-session <session.zip>
+"""
+
+import json, os, sys, zipfile
+from pathlib import Path
+
+archive = Path(sys.argv[1]) if len(sys.argv) > 1 else sys.exit("usage: restore-cc-session <session.zip>")
+if not archive.is_file():
+    sys.exit(f"not found: {archive}")
+
+new_path = os.getcwd()
+projects = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude")) / "projects"
+new_dir = projects / new_path.replace("/", "-")
+
+with zipfile.ZipFile(archive) as zf:
+    # Find the main .jsonl to detect the old path
+    jsonls = [n for n in zf.namelist() if n.endswith(".jsonl") and "/" not in n]
+    if not jsonls:
+        sys.exit("no session .jsonl found in archive")
+
+    # Read old cwd from first JSONL entry that has one
+    old_path = None
+    for line in zf.read(jsonls[0]).decode().splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "cwd" in entry:
+            old_path = entry["cwd"]
+            break
+
+    if not old_path:
+        sys.exit("could not detect original path from session data")
+
+    new_dir.mkdir(parents=True, exist_ok=True)
+    need_rewrite = old_path != new_path
+    if need_rewrite:
+        print(f"Rewriting: {old_path} -> {new_path}\n")
+
+    for name in zf.namelist():
+        dst = new_dir / name
+        if dst.exists():
+            print(f"  skip {name}")
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        data = zf.read(name)
+        if need_rewrite and name.endswith((".jsonl", ".json")):
+            data = data.replace(old_path.encode(), new_path.encode())
+        dst.write_bytes(data)
+        print(f"  {name}")
+
+sid = Path(jsonls[0]).stem
+print(f"\n  -> claude --resume {sid}")
