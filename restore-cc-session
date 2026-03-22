@@ -7,23 +7,24 @@ Usage: restore-cc-session <session.zip>
 import json, os, sys, zipfile
 from pathlib import Path
 
-archive = Path(sys.argv[1]) if len(sys.argv) > 1 else sys.exit("usage: restore-cc-session <session.zip>")
+if len(sys.argv) < 2:
+    sys.exit("usage: restore-cc-session <session.zip>")
+
+archive = Path(sys.argv[1])
 if not archive.is_file():
     sys.exit(f"not found: {archive}")
 
 new_path = os.getcwd()
-projects = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude")) / "projects"
-new_dir = projects / new_path.replace("/", "-")
+projects_dir = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude")) / "projects"
+new_project = projects_dir / new_path.replace("/", "-")
 
 with zipfile.ZipFile(archive) as zf:
-    # Find the main .jsonl to detect the old path
-    jsonls = [n for n in zf.namelist() if n.endswith(".jsonl") and "/" not in n]
-    if not jsonls:
+    session_jsonls = [n for n in zf.namelist() if n.endswith(".jsonl") and "/" not in n]
+    if not session_jsonls:
         sys.exit("no session .jsonl found in archive")
 
-    # Read old cwd from first JSONL entry that has one
     old_path = None
-    for line in zf.read(jsonls[0]).decode().splitlines():
+    for line in zf.read(session_jsonls[0]).decode().splitlines():
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -35,13 +36,13 @@ with zipfile.ZipFile(archive) as zf:
     if not old_path:
         sys.exit("could not detect original path from session data")
 
-    new_dir.mkdir(parents=True, exist_ok=True)
     need_rewrite = old_path != new_path
+    new_project.mkdir(parents=True, exist_ok=True)
     if need_rewrite:
         print(f"Rewriting: {old_path} -> {new_path}\n")
 
     for name in zf.namelist():
-        dst = new_dir / name
+        dst = new_project / name
         if dst.exists():
             print(f"  skip {name}")
             continue
@@ -52,5 +53,5 @@ with zipfile.ZipFile(archive) as zf:
         dst.write_bytes(data)
         print(f"  {name}")
 
-sid = Path(jsonls[0]).stem
-print(f"\n  -> claude --resume {sid}")
+session_id = Path(session_jsonls[0]).stem
+print(f"\n  -> claude --resume {session_id}")

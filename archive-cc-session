@@ -7,27 +7,32 @@ Usage: archive-cc-session <session-uuid>
 import os, sys, zipfile
 from pathlib import Path
 
-sid = sys.argv[1] if len(sys.argv) > 1 else sys.exit("usage: archive-cc-session <session-uuid>")
-projects = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude")) / "projects"
+if len(sys.argv) < 2:
+    sys.exit("usage: archive-cc-session <session-uuid>")
 
-# Find the session across all project directories
-matches = list(projects.glob(f"*/{sid}.jsonl"))
+session_id = sys.argv[1]
+projects_dir = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude")) / "projects"
+
+matches = list(projects_dir.glob(f"*/{session_id}.jsonl"))
 if not matches:
-    sys.exit(f"session not found: {sid}")
+    sys.exit(f"session not found: {session_id}")
 if len(matches) > 1:
-    sys.exit(f"session found in multiple projects, delete duplicates first:\n" +
+    sys.exit("session found in multiple projects, delete duplicates first:\n" +
              "\n".join(f"  {m}" for m in matches))
 
 project_dir = matches[0].parent
-jsonl = matches[0]
-files = [jsonl] + (sorted((project_dir / sid).rglob("*")) if (project_dir / sid).is_dir() else [])
+subdir = project_dir / session_id
+
+files = [matches[0]]
+if subdir.is_dir():
+    files += sorted(subdir.rglob("*"))
 files = [f for f in files if f.is_file()]
 
-out = Path(f"{sid}.zip")
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+output = Path(f"{session_id}.zip")
+with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
     for f in files:
         arcname = f.relative_to(project_dir)
         zf.write(f, arcname)
         print(f"  {arcname}")
 
-print(f"\n{out} ({out.stat().st_size / 1024:.0f}KB, {len(files)} file(s))")
+print(f"\n{output} ({output.stat().st_size / 1024:.0f}KB, {len(files)} file(s))")
