@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# cc-tunnel <remote-host> — bridge Claude Code peer sockets between this host
+# and <remote-host> so cross-session ListAgents / SendMessage work both ways.
+#
+# Runs in the foreground and holds the tunnel open. Ctrl-C (or any exit) kills
+# the ssh and removes the registry entries + forwarded sockets it created.
+#
+# Static: enumerates sessions once at startup. Sessions that start later aren't
+# bridged; re-run to pick them up.
+set -euo pipefail
+
+host=${1:?usage: cc-tunnel <remote-host>}
+sess="$HOME/.claude/sessions"
+rsess='.claude/sessions'        # remote, relative to remote $HOME
+socks='/tmp/cc-socks'
+ssh=(ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none)
+fwdopts=(-o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o ServerAliveInterval=30)
+
+# pid<TAB>socket for every registered session, locally and on the remote.
+jqline='[.pid,.messagingSocketPath]|@tsv'
+local=$(for f in "$sess"/*.json; do jq -r "$jqline" "$f"; done 2>/dev/null || true)
+remote=$("${ssh[@]}" "$host" "cd $rsess 2>/dev/null && for f in *.json; do jq -r '$jqline' \"\$f\"; done" 2>/dev/null || true)
+
+lpids=$(awk 'NF{print $1}' <<<"$local"  | sort -u)
+rpids=$(awk 'NF{print $1}' <<<"$remote" | sort -u)
+# Skip any pid that exists on BOTH hosts — same filename and socket path would
+# clobber the native entry.
+ronly=$(comm -23 <(echo "$rpids") <(echo "$lpids") | awk 'NF')
+lonly=$(comm -23 <(echo "$lpids") <(echo "$rpids") | awk 'NF')
+
+fwd=()
+# -L: expose each remote-only session's socket at the same path here.
+while read -r pid sock; do
+  [ -n "$pid" ] && grep -qxF "$pid" <<<"$ronly" && fwd+=(-L "$sock:$sock")
+done <<<"$remote"
+# -R: expose each local-only session's socket at the same path on the remote.
+while read -r pid sock; do
+  [ -n "$pid" ] && grep -qxF "$pid" <<<"$lonly" && fwd+=(-R "$sock:$sock")
+done <<<"$local"
+
+sshpid=""; _done=""
+cleanup() {
+  [ -n "$_done" ] && return; _done=1
+  [ -n "$sshpid" ] && kill "$sshpid" 2>/dev/null || true
+  for pid in $ronly; do rm -f "$sess/$pid".* "$socks/$pid.sock"; done
+  [ -n "$lonly" ] && "${ssh[@]}" "$host" "cd $rsess && rm -f $(printf '%s.* ' $lonly)" 2>/dev/null || true
+  echo "cc-tunnel: torn down"
+}
+trap cleanup EXIT INT TERM
+
+# Copy registry entries (<pid>.json + <pid>.<hash>.key) both ways so each side
+# can resolve the other's session names.
+for pid in $lonly; do scp -pq -o BatchMode=yes "$sess/$pid".* "$host:$rsess/"; done
+for pid in $ronly; do scp -pq -o BatchMode=yes "$host:$rsess/$pid".* "$sess/"; done
+
+echo "cc-tunnel: bridging $(( ${#fwd[@]} / 2 )) session(s) with $host; Ctrl-C to stop"
+"${ssh[@]}" "${fwdopts[@]}" -N "${fwd[@]}" "$host" &
+sshpid=$!
+wait "$sshpid"
