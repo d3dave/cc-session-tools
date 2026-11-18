@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""Bridge Claude Code peer sockets to a remote host over SSH.
-
-So cross-session ListAgents / SendMessage work both ways. Runs in the
-foreground; tears everything down on exit.
+"""Bridge Claude Code peer sockets and registry entries with a remote host
+over SSH, both ways. Foreground; cleans up on exit.
 
 Usage: cc-tunnel <remote-host>
 """
 
-import json, signal, subprocess, sys
+import json, shlex, signal, subprocess, sys
 from pathlib import Path
 
 SESSIONS = Path.home() / ".claude" / "sessions"
 RSESSIONS = ".claude/sessions"   # relative to the remote $HOME
-SOCKS = Path("/tmp/cc-socks")
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none"]
 FWD_OPTS = ["-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
             "-o", "ServerAliveInterval=30"]
@@ -53,27 +50,31 @@ def main():
     remote = remote_sessions(host)
     # Skip any pid present on both hosts: same filename and socket path would
     # clobber the native entry.
-    remote_only = {p: s for p, s in remote.items() if p not in local}
-    local_only = {p: s for p, s in local.items() if p not in remote}
+    remote_only = {pid: sock for pid, sock in remote.items() if pid not in local}
+    local_only = {pid: sock for pid, sock in local.items() if pid not in remote}
 
     forwards = []
     for sock in remote_only.values():   # -L: remote session's socket, here
         forwards += ["-L", f"{sock}:{sock}"]
     for sock in local_only.values():    # -R: local session's socket, on remote
         forwards += ["-R", f"{sock}:{sock}"]
+    if not forwards:
+        sys.exit(f"cc-tunnel: nothing to bridge with {host}")
 
     proc = None
 
     def cleanup(*_):
         if proc and proc.poll() is None:
             proc.terminate()
-        for pid in remote_only:
+        for pid, sock in remote_only.items():
             for f in SESSIONS.glob(f"{pid}.*"):
                 f.unlink(missing_ok=True)
-            (SOCKS / f"{pid}.sock").unlink(missing_ok=True)
+            Path(sock).unlink(missing_ok=True)
         if local_only:
-            rm = "cd {} && rm -f {}".format(
-                RSESSIONS, " ".join(f"{pid}.*" for pid in local_only))
+            # sshd leaves -R listener files behind; remove them too.
+            targets = [f"{pid}.*" for pid in local_only]
+            targets += [shlex.quote(sock) for sock in local_only.values()]
+            rm = "cd {} && rm -f {}".format(RSESSIONS, " ".join(targets))
             subprocess.run(SSH + [host, rm], capture_output=True)
         print("cc-tunnel: torn down")
 
@@ -92,7 +93,8 @@ def main():
         print(f"cc-tunnel: bridging {len(forwards) // 2} session(s) with {host}; "
               "Ctrl-C to stop")
         proc = subprocess.Popen(SSH + FWD_OPTS + ["-N", *forwards, host])
-        proc.wait()
+        if proc.wait() != 0:
+            sys.exit(f"cc-tunnel: ssh exited with status {proc.returncode}")
     except KeyboardInterrupt:
         pass
     except subprocess.CalledProcessError as err:
