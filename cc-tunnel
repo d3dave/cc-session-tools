@@ -1,59 +1,105 @@
-#!/usr/bin/env bash
-# cc-tunnel <remote-host> — bridge Claude Code peer sockets between this host
-# and <remote-host> so cross-session ListAgents / SendMessage work both ways.
-#
-# Runs in the foreground and holds the tunnel open. Ctrl-C (or any exit) kills
-# the ssh and removes the registry entries + forwarded sockets it created.
-#
-# Static: enumerates sessions once at startup. Sessions that start later aren't
-# bridged; re-run to pick them up.
-set -euo pipefail
+#!/usr/bin/env python3
+"""Bridge Claude Code peer sockets to a remote host over SSH.
 
-host=${1:?usage: cc-tunnel <remote-host>}
-sess="$HOME/.claude/sessions"
-rsess='.claude/sessions'        # remote, relative to remote $HOME
-socks='/tmp/cc-socks'
-ssh=(ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none)
-fwdopts=(-o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o ServerAliveInterval=30)
+So cross-session ListAgents / SendMessage work both ways. Runs in the
+foreground; tears everything down on exit.
 
-# pid<TAB>socket for every registered session, locally and on the remote.
-jqline='[.pid,.messagingSocketPath]|@tsv'
-local=$(for f in "$sess"/*.json; do jq -r "$jqline" "$f"; done 2>/dev/null || true)
-remote=$("${ssh[@]}" "$host" "cd $rsess 2>/dev/null && for f in *.json; do jq -r '$jqline' \"\$f\"; done" 2>/dev/null || true)
+Usage: cc-tunnel <remote-host>
+"""
 
-lpids=$(awk 'NF{print $1}' <<<"$local"  | sort -u)
-rpids=$(awk 'NF{print $1}' <<<"$remote" | sort -u)
-# Skip any pid that exists on BOTH hosts — same filename and socket path would
-# clobber the native entry.
-ronly=$(comm -23 <(echo "$rpids") <(echo "$lpids") | awk 'NF')
-lonly=$(comm -23 <(echo "$lpids") <(echo "$rpids") | awk 'NF')
+import json, signal, subprocess, sys
+from pathlib import Path
 
-fwd=()
-# -L: expose each remote-only session's socket at the same path here.
-while read -r pid sock; do
-  [ -n "$pid" ] && grep -qxF "$pid" <<<"$ronly" && fwd+=(-L "$sock:$sock")
-done <<<"$remote"
-# -R: expose each local-only session's socket at the same path on the remote.
-while read -r pid sock; do
-  [ -n "$pid" ] && grep -qxF "$pid" <<<"$lonly" && fwd+=(-R "$sock:$sock")
-done <<<"$local"
+SESSIONS = Path.home() / ".claude" / "sessions"
+RSESSIONS = ".claude/sessions"   # relative to the remote $HOME
+SOCKS = Path("/tmp/cc-socks")
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none"]
+FWD_OPTS = ["-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
+            "-o", "ServerAliveInterval=30"]
 
-sshpid=""; _done=""
-cleanup() {
-  [ -n "$_done" ] && return; _done=1
-  [ -n "$sshpid" ] && kill "$sshpid" 2>/dev/null || true
-  for pid in $ronly; do rm -f "$sess/$pid".* "$socks/$pid.sock"; done
-  [ -n "$lonly" ] && "${ssh[@]}" "$host" "cd $rsess && rm -f $(printf '%s.* ' $lonly)" 2>/dev/null || true
-  echo "cc-tunnel: torn down"
-}
-trap cleanup EXIT INT TERM
 
-# Copy registry entries (<pid>.json + <pid>.<hash>.key) both ways so each side
-# can resolve the other's session names.
-for pid in $lonly; do scp -pq -o BatchMode=yes "$sess/$pid".* "$host:$rsess/"; done
-for pid in $ronly; do scp -pq -o BatchMode=yes "$host:$rsess/$pid".* "$sess/"; done
+def parse_sessions(lines):
+    """Map pid to messaging socket path from registry JSON lines."""
+    sessions = {}
+    for line in lines:
+        try:
+            data = json.loads(line)
+            sessions[str(data["pid"])] = data["messagingSocketPath"]
+        except (ValueError, KeyError):
+            continue
+    return sessions
 
-echo "cc-tunnel: bridging $(( ${#fwd[@]} / 2 )) session(s) with $host; Ctrl-C to stop"
-"${ssh[@]}" "${fwdopts[@]}" -N "${fwd[@]}" "$host" &
-sshpid=$!
-wait "$sshpid"
+
+def local_sessions():
+    """Return {pid: socket} for every session registered on this host."""
+    return parse_sessions(f.read_text() for f in SESSIONS.glob("*.json"))
+
+
+def remote_sessions(host):
+    """Return {pid: socket} for every session registered on the remote host."""
+    cmd = f'for f in "$HOME"/{RSESSIONS}/*.json; do cat "$f"; echo; done'
+    result = subprocess.run(SSH + [host, cmd], capture_output=True, text=True)
+    if result.returncode != 0 and not result.stdout.strip():
+        sys.exit(f"cannot reach {host}: {result.stderr.strip()}")
+    return parse_sessions(result.stdout.splitlines())
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: cc-tunnel <remote-host>")
+    host = sys.argv[1]
+
+    local = local_sessions()
+    remote = remote_sessions(host)
+    # Skip any pid present on both hosts: same filename and socket path would
+    # clobber the native entry.
+    remote_only = {p: s for p, s in remote.items() if p not in local}
+    local_only = {p: s for p, s in local.items() if p not in remote}
+
+    forwards = []
+    for sock in remote_only.values():   # -L: remote session's socket, here
+        forwards += ["-L", f"{sock}:{sock}"]
+    for sock in local_only.values():    # -R: local session's socket, on remote
+        forwards += ["-R", f"{sock}:{sock}"]
+
+    proc = None
+
+    def cleanup(*_):
+        if proc and proc.poll() is None:
+            proc.terminate()
+        for pid in remote_only:
+            for f in SESSIONS.glob(f"{pid}.*"):
+                f.unlink(missing_ok=True)
+            (SOCKS / f"{pid}.sock").unlink(missing_ok=True)
+        if local_only:
+            rm = "cd {} && rm -f {}".format(
+                RSESSIONS, " ".join(f"{pid}.*" for pid in local_only))
+            subprocess.run(SSH + [host, rm], capture_output=True)
+        print("cc-tunnel: torn down")
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        # Copy registry entries (<pid>.json + <pid>.<hash>.key) both ways so
+        # each side can resolve the other's session names.
+        for pid in local_only:
+            files = [str(f) for f in SESSIONS.glob(f"{pid}.*")]
+            subprocess.run(["scp", "-pq", "-o", "BatchMode=yes", *files,
+                            f"{host}:{RSESSIONS}/"], check=True)
+        for pid in remote_only:
+            subprocess.run(["scp", "-pq", "-o", "BatchMode=yes",
+                            f"{host}:{RSESSIONS}/{pid}.*", f"{SESSIONS}/"], check=True)
+
+        print(f"cc-tunnel: bridging {len(forwards) // 2} session(s) with {host}; "
+              "Ctrl-C to stop")
+        proc = subprocess.Popen(SSH + FWD_OPTS + ["-N", *forwards, host])
+        proc.wait()
+    except KeyboardInterrupt:
+        pass
+    except subprocess.CalledProcessError as err:
+        sys.exit(f"cc-tunnel: {err}")
+    finally:
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()

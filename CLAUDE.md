@@ -9,7 +9,7 @@ Scripts for managing Claude Code session state. Most operate on session files un
 - **`migrate-cc-project`** — Migrate all sessions from an old project path to CWD after a repo rename/move. Rewrites `cwd` paths in JSONL/JSON files. Prompts whether to delete the old directory: if kept, sessions get new UUIDs to avoid duplicate IDs; if deleted, IDs are preserved.
 - **`archive-cc-session`** — Zip a session (by UUID) for backup or transfer. Searches all project directories; errors on ambiguous matches.
 - **`restore-cc-session`** — Extract an archived session zip into the current project directory. Auto-detects the original path from session data and rewrites it to match CWD.
-- **`cc-tunnel`** — Bridge peer-messaging sockets to a remote host over SSH so cross-session `ListAgents` / `SendMessage` work both ways. Bash, not Python. Enumerates sessions once at startup, SSH-forwards each socket, copies registry entries both ways, and on exit kills the SSH and removes everything it copied.
+- **`cc-tunnel`** — Bridge peer-messaging sockets to a remote host over SSH so cross-session `ListAgents` / `SendMessage` work both ways. Enumerates sessions once at startup, SSH-forwards each socket, copies registry entries both ways, and on exit kills the SSH and removes everything it copied.
 
 ## Usage
 
